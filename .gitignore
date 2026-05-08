@@ -1,0 +1,26 @@
+#hide log in credentials
+*creds.py
+
+#hide vs code specific & cache files
+.vscode/
+__pycache__/
+.DS_Store
+
+
+
+#hide any data or output files
+*.csv
+data/
+figure_data/
+figures/
+figs/
+*.png
+*.tiff
+*.tif
+*.pdf
+*.json
+*.svg
+*.txt
+
+slurm_archive/
+slurm*.out
