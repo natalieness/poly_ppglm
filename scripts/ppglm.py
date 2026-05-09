@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import time
+import ast 
 
 import numpy as np
 import pandas as pd
@@ -13,12 +14,6 @@ import seaborn as sns
 
 from scripts.plot_networks import build_connectivity_graph, plot_connectivity_graph
 from scripts.plotting_activity import plot_spikes
-
-
-# ---------------------------------------------------------------------
-# Parameter containers
-# ---------------------------------------------------------------------
-
 
 @dataclass
 class NeuronParams:
@@ -875,6 +870,37 @@ class LinkedReleasePPGLM:
                 )
 
 #%% creating fake networks 
+
+def load_connectome_from_csv(con_path: str, inhibitory_neurons_path: str, axo_axonic_path: str,
+                             postsyn_col: str = 'postsynaptic_to', presyn_col: str = 'presynaptic_to', 
+                             connector_col: str = 'connector_id'):
+    con = pd.read_csv(con_path)
+    con[postsyn_col] = con[postsyn_col].apply(ast.literal_eval)
+    con[presyn_col] = con[presyn_col].astype(int)
+    con[connector_col] = con[connector_col].astype(str)
+
+    # convert to connectivity dict format: {pre: {synapse_id: [postsynaptic partners]}}
+    connectivity: Dict[str, Dict[str, List[str]]] = {}
+    con.groupby(presyn_col).apply(lambda g: connectivity.setdefault(str(g.name), {}).update(
+        {connector_id: postsyn_list for connector_id, postsyn_list in zip(g[connector_col], g[postsyn_col])}
+    ))
+
+    # inhibitory neurons 
+    inh = pd.read_csv(inhibitory_neurons_path)
+    inhibitory_neurons = set(inh['skid'].tolist())
+
+    # get neurons for sim 
+    neurons = list(con[presyn_col].append(con[postsyn_col].explode()).unique())
+
+    inhibitory_neurons = set([n for n in inhibitory_neurons if n in neurons])
+
+    # synapse defaults aby pre 
+    raise NotImplementedError("synapse defaults by pre not implemented yet, need to load from csv if desired")
+    # kc aco axonic synapses with special synapse ones
+
+
+
+
 
 def create_connectome(n_neurons: int = 10, n_inhibitory: int = 2, \
                         mean_outgoing: int = 3, sd_outgoing: int = 1, \
