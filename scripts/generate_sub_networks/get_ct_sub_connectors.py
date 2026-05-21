@@ -7,7 +7,7 @@ import numpy as np
 neurons = pd.read_csv('data/neuron_details.csv')
 kc_axo_axonic = pd.read_csv('data/kc_axo_axonic.csv')
 neurons_nt = pd.read_csv('data/20260205_corrected_nts.csv')
-connectors = pd.read_csv('data/polyadic_connectors.csv', dtype={'presynaptic_id': 'Int64', 'postsynaptic_id': 'string'})
+connectors = pd.read_csv('data/polyadic_connectors.csv')
 
 
 restrict_network = ['KCs', 'MBINs', 'MBONs', 'MB-FBNs'] # set to None to include all neurons with connectors
@@ -19,12 +19,16 @@ celltype_pops = {ct: neurons[neurons['celltype']==ct]['skeleton_id'].to_list() f
 if restrict_network is not None:
     pop_skids = []
     for pop in restrict_network:
+        if pop not in celltype_pops:
+            print(f"Warning: celltype '{pop}' not found in neuron_details. Available: {sorted(celltype_pops)}")
+            continue
         pop_skids += celltype_pops[pop]
         if isinstance(pop_skids[0], list):
             pop_skids = list(chain.from_iterable(pop_skids))
-        all_neurons = pop_skids
+    all_neurons = pop_skids
 
-# only get connectors from neurons in the network 
+# only get connectors from neurons in the network
+connectors = connectors.dropna(subset=['presynaptic_id'])
 connectors['presynaptic_id'] = connectors['presynaptic_id'].astype(int)
 connectors = connectors[connectors['presynaptic_id'].isin(all_neurons)]
 connectors['postsynaptic_id'] = connectors['postsynaptic_id'].apply(ast.literal_eval)
@@ -34,9 +38,9 @@ connectors = connectors[connectors['postsynaptic_id'].apply(len) > 0] # drop con
 
 
 # process kc axo-axonic connections 
-kc_axo_axonic['postsynaptic_to'] = kc_axo_axonic['postsynaptic_to'].apply(ast.literal_eval)
+kc_axo_axonic['postsynaptic_id'] = kc_axo_axonic['postsynaptic_to'].apply(ast.literal_eval)
 kc_axo_axonic['connector_id'] = kc_axo_axonic['connector_id'].astype(int)
-kc_aa = dict(zip(kc_axo_axonic['connector_id'], kc_axo_axonic['postsynaptic_to']))
+kc_aa = dict(zip(kc_axo_axonic['connector_id'], kc_axo_axonic['postsynaptic_id']))
 kc_aa_skids = set(kc_axo_axonic['presynaptic_to'].tolist()) # to quickly look up 
 
 

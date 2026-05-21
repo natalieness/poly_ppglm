@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import time
-import ast 
+import ast
 
 import numpy as np
 import pandas as pd
@@ -73,6 +73,10 @@ class ReleaseSite:
     pre: str
     synapse_id: str
     partners: List[str]
+
+    # adding this pretty complicated extra thing here to allow different exc.inh effect dependent on partner identity 
+    # to enable inhibition for postsyn. neurons that are known to express receptors that cause inhibition in response to acetylcholine only on their axons
+    partner_weight_multipliers: Optional[Dict[str, float]] = None
 
     # Same weight and delay apply to every postsynaptic partner at this site.
     weight: float = 1.0
@@ -191,6 +195,7 @@ class LinkedReleasePPGLM:
     ALLOWED_SYNAPSE_FIELDS = {
         "weight",
         "delay_s",
+        "partner_weight_multipliers",
         "p_mode",
         "p_release",
         "beta_alpha",
@@ -224,7 +229,7 @@ class LinkedReleasePPGLM:
         syn_tau_s: float = 0.010,
         max_rate_hz: float = 500.0,
         seed: Optional[int] = None,
-        record_failed_release_attempts: bool = True,
+        record_failed_release_attempts: bool = False,
     ):
         self.neurons = list(neurons)
         self.name_to_idx = {name: i for i, name in enumerate(self.neurons)}
@@ -261,9 +266,40 @@ class LinkedReleasePPGLM:
             for site in self.release_sites
         }
 
+        # Pre-computed arrays for the simulation hot path.
+        self._neuron_p_release = np.array(
+            [self.neuron_params[n].p_release for n in self.neurons], dtype=float
+        )
+        self._stp_site_indices: List[int] = [
+            i for i, s in enumerate(self.release_sites) if s.stp_enabled
+        ]
+        self._build_site_cache()
+
     # -----------------------------------------------------------------
     # Builders
     # -----------------------------------------------------------------
+
+    def _build_site_cache(self) -> None:
+        """Pre-compute per-site arrays used in the simulation hot path."""
+        self._cache_post_idx: List[np.ndarray] = []
+        self._cache_eff_weight: List[np.ndarray] = []
+        self._cache_delay_bin: List[int] = []
+
+        for site in self.release_sites:
+            post_idxs = np.array(
+                [self.name_to_idx[p] for p in site.partners], dtype=np.intp
+            )
+            if site.partner_weight_multipliers:
+                mults = np.array(
+                    [site.partner_weight_multipliers.get(p, 1.0) for p in site.partners],
+                    dtype=float,
+                )
+            else:
+                mults = np.ones(len(site.partners), dtype=float)
+
+            self._cache_post_idx.append(post_idxs)
+            self._cache_eff_weight.append((site.weight * mults))
+            self._cache_delay_bin.append(int(round(site.delay_s / self.dt_s)))
 
     @classmethod
     def from_simple_connectivity(
@@ -423,6 +459,7 @@ class LinkedReleasePPGLM:
 
             A clamped neuron only spikes at the provided times.
         """
+        s1 = time.time()
         n_bins = int(np.ceil(self.t_stop_s / self.dt_s))
         time_s = np.arange(n_bins) * self.dt_s
 
@@ -441,6 +478,9 @@ class LinkedReleasePPGLM:
         self_history = np.zeros(self.n_neurons, dtype=float)
 
         stp_x = np.ones(self.n_sites, dtype=float)
+
+        s2 = time.time()
+        print(f"Initial setup time: {s2 - s1:.2f} seconds")
 
         base_log_rates = np.array(
             [
@@ -465,16 +505,22 @@ class LinkedReleasePPGLM:
             ],
             dtype=float,
         )
+        s3 = time.time()
+        print(f"Pre-compute parameter arrays time: {s3 - s2:.2f} seconds")
 
         forced = self._make_forced_spike_matrix(clamped_spikes, n_bins)
-
+        s4 = time.time()
+        print(f"Process clamped spikes time: {s4 - s3:.2f} seconds")
         spike_records: List[Dict[str, Any]] = []
         release_records: List[Dict[str, Any]] = []
 
         syn_decay = np.exp(-self.dt_s / max(self.syn_tau_s, 1e-12))
         self_decay = np.exp(-self.dt_s / self_taus)
-
+        s5 = time.time()
+        print(f"Pre-compute decay factors time: {s5 - s4:.2f} seconds")
         for b, t in enumerate(time_s):
+            if b == 0:
+                s6 = time.time()
             # Update synaptic drive.
             syn_drive *= syn_decay
             syn_drive += pending_input[:, b]
@@ -488,9 +534,14 @@ class LinkedReleasePPGLM:
             # External input.
             ext = self._external_at_bin(external_log_drive, b, t, n_bins)
 
+            if b == 0:
+                s71 = time.time()
+                print("one loop pre-spike time: ", s71 - s6)
+
             # Point-process GLM intensity in Hz.
             eta = base_log_rates + ext + syn_drive + self_history
             lam = np.exp(eta)
+            # NOTE: eta may grow too fast for clipping - in this case neuron params / network params are not well set.
             lam = np.clip(lam, 0.0, self.max_rate_hz)
 
             lambda_hz[:, b] = lam
@@ -500,6 +551,10 @@ class LinkedReleasePPGLM:
             spike_prob = 1.0 - np.exp(-lam * self.dt_s)
             spiked = self.rng.random(self.n_neurons) < spike_prob
 
+            if b == 0:
+                s72 = time.time()
+                print("one loop pre-release time: ", s72 - s71)
+
             # Override generated spikes for clamped neurons.
             if forced is not None:
                 clamped_mask = forced["clamped_neuron_mask"]
@@ -507,8 +562,14 @@ class LinkedReleasePPGLM:
                 spiked[clamped_mask] = forced_spikes[clamped_mask, b]
 
             spiking_indices = np.flatnonzero(spiked)
+            if b == 0:
+                s73 = time.time()
+                print("one loop pre-release time: ", s73 - s72)
 
             for pre_idx in spiking_indices:
+                if b == 0 and pre_idx == spiking_indices[0]:
+                    s74 = time.time()
+                    print("one loop first spike time: ", s74 - s73)
                 pre = self.neurons[pre_idx]
 
                 spike_records.append(
@@ -522,9 +583,6 @@ class LinkedReleasePPGLM:
 
                 self_history[pre_idx] += self_weights[pre_idx]
 
-                # Stores neuron-wide stochastic draws for this spike.
-                # Example: neuron_gamma_cox_per_spike should be shared across
-                # all release sites from this presynaptic spike.
                 spike_context: Dict[str, float] = {}
 
                 for site_idx in self.sites_by_pre_idx.get(pre_idx, []):
@@ -532,6 +590,7 @@ class LinkedReleasePPGLM:
 
                     p_eff = self._draw_release_probability(
                         pre=pre,
+                        pre_idx=pre_idx,
                         site=site,
                         stp_x_value=stp_x[site_idx],
                         spike_context=spike_context,
@@ -549,6 +608,11 @@ class LinkedReleasePPGLM:
                         pending_input=pending_input,
                         release_records=release_records,
                     )
+                if b == 0 and pre_idx == spiking_indices[0]:
+                    s75 = time.time()
+                    print("one loop post-release time: ", s75 - s74)
+            s7 = time.time()
+            print("one loop time: ", s7 - s6)
 
         spikes_df = pd.DataFrame(spike_records)
         release_df = pd.DataFrame(release_records)
@@ -561,186 +625,6 @@ class LinkedReleasePPGLM:
             time_s=time_s,
             neuron_names=self.neurons,
         )
-
-    # -----------------------------------------------------------------
-    # Release-site processing
-    # -----------------------------------------------------------------
-
-    def _process_release_site(
-        self,
-        *,
-        pre: str,
-        pre_idx: int,
-        site_idx: int,
-        site: ReleaseSite,
-        parent_spike_time_s: float,
-        current_bin: int,
-        p_eff: float,
-        stp_x: np.ndarray,
-        pending_input: np.ndarray,
-        release_records: List[Dict[str, Any]],
-    ) -> None:
-        n_partners = len(site.partners)
-
-        # Release success/failure.
-        if site.share_release_across_partners:
-            released_shared = self.rng.random() < p_eff
-            release_by_partner = [released_shared] * n_partners
-        else:
-            release_by_partner = [
-                self.rng.random() < p_eff
-                for _ in range(n_partners)
-            ]
-
-        # Amplitude Q.
-        if site.share_amplitude_across_partners:
-            q_shared = self._draw_amplitude(site)
-            q_by_partner = [q_shared] * n_partners
-        else:
-            q_by_partner = [
-                self._draw_amplitude(site)
-                for _ in range(n_partners)
-            ]
-
-        if site.conserve_amplitude_across_partners and n_partners > 0:
-            q_by_partner = [q / n_partners for q in q_by_partner]
-
-        # Latency jitter.
-        if site.share_jitter_across_partners:
-            jitter_shared = self.rng.normal(0.0, site.jitter_sd_s)
-            jitter_by_partner = [jitter_shared] * n_partners
-        else:
-            jitter_by_partner = [
-                self.rng.normal(0.0, site.jitter_sd_s)
-                for _ in range(n_partners)
-            ]
-
-        any_success = any(release_by_partner)
-
-        # Simple short-term depression.
-        if site.stp_enabled and any_success:
-            stp_x[site_idx] -= site.stp_depletion_per_success
-            stp_x[site_idx] = np.clip(stp_x[site_idx], 0.0, 1.0)
-
-        for post, released, q, jitter in zip(
-            site.partners,
-            release_by_partner,
-            q_by_partner,
-            jitter_by_partner,
-        ):
-            post_idx = self.name_to_idx[post]
-
-            arrival_time_s = (
-                parent_spike_time_s
-                + site.delay_s
-                + jitter
-            )
-
-            arrival_bin = int(np.round(arrival_time_s / self.dt_s))
-
-            # Prevent zero-delay causal loop within the same bin.
-            arrival_bin = max(arrival_bin, current_bin + 1)
-
-            amplitude = float(released) * q * site.weight
-
-            if released and arrival_bin < pending_input.shape[1]:
-                pending_input[post_idx, arrival_bin] += amplitude
-
-            if released or self.record_failed_release_attempts:
-                release_records.append(
-                    {
-                        "parent_spike_time_s": parent_spike_time_s,
-                        "arrival_time_s": arrival_bin * self.dt_s,
-                        "pre": pre,
-                        "pre_idx": pre_idx,
-                        "synapse_id": site.synapse_id,
-                        "site_uid": site.uid,
-                        "post": post,
-                        "post_idx": post_idx,
-                        "released": bool(released),
-                        "p_release_eff": p_eff,
-                        "q": q,
-                        "weight": site.weight,
-                        "amplitude": amplitude,
-                        "delay_s": site.delay_s,
-                        "jitter_s": jitter,
-                        "n_partners_at_site": n_partners,
-                        "share_release_across_partners": site.share_release_across_partners,
-                        "share_amplitude_across_partners": site.share_amplitude_across_partners,
-                        "share_jitter_across_partners": site.share_jitter_across_partners,
-                        "stp_x_after": stp_x[site_idx],
-                    }
-                )
-
-    def _draw_release_probability(
-        self,
-        *,
-        pre: str,
-        site: ReleaseSite,
-        stp_x_value: float,
-        spike_context: Dict[str, float],
-    ) -> float:
-        mode = site.p_mode or self.default_p_mode
-        npar = self.neuron_params[pre]
-
-        if mode == "site_constant":
-            p = npar.p_release if site.p_release is None else site.p_release
-
-        elif mode == "neuron_constant":
-            p = npar.p_release
-
-        elif mode == "site_beta_static":
-            p = self._site_beta_static_p[site.uid]
-
-        elif mode == "neuron_beta_static":
-            p = self._neuron_beta_static_p[pre]
-
-        elif mode == "site_gamma_cox_per_spike":
-            rho = self.rng.gamma(site.gamma_shape, site.gamma_scale)
-            p = 1.0 - np.exp(-rho * site.gamma_cox_scale)
-
-        elif mode == "neuron_gamma_cox_per_spike":
-            key = f"neuron_gamma_cox:{pre}"
-            if key not in spike_context:
-                rho = self.rng.gamma(npar.gamma_shape, npar.gamma_scale)
-                spike_context[key] = 1.0 - np.exp(-rho * npar.gamma_cox_scale)
-            p = spike_context[key]
-
-        else:
-            raise ValueError(f"Unknown p_mode: {mode!r}")
-
-        p = float(np.clip(p, 0.0, 1.0))
-
-        if site.stp_enabled:
-            p *= float(np.clip(stp_x_value, 0.0, 1.0))
-
-        return float(np.clip(p, 0.0, 1.0))
-
-    def _draw_amplitude(self, site: ReleaseSite) -> float:
-        if site.q_mode == "fixed":
-            return float(site.q_mean)
-
-        if site.q_mode == "gamma":
-            shape = max(site.q_gamma_shape, 1e-12)
-            scale = site.q_mean / shape
-            return float(self.rng.gamma(shape, scale))
-
-        if site.q_mode == "lognormal":
-            sigma = site.q_lognormal_sigma
-            mu = np.log(max(site.q_mean, 1e-12)) - 0.5 * sigma**2
-            return float(self.rng.lognormal(mean=mu, sigma=sigma))
-
-        raise ValueError(f"Unknown q_mode: {site.q_mode!r}")
-
-    def _recover_stp(self, stp_x: np.ndarray) -> None:
-        for site_idx, site in enumerate(self.release_sites):
-            if not site.stp_enabled:
-                continue
-
-            tau = max(site.stp_tau_recovery_s, 1e-12)
-            recovery_fraction = 1.0 - np.exp(-self.dt_s / tau)
-            stp_x[site_idx] += (1.0 - stp_x[site_idx]) * recovery_fraction
-            stp_x[site_idx] = np.clip(stp_x[site_idx], 0.0, 1.0)
 
     # -----------------------------------------------------------------
     # Input helpers
@@ -773,6 +657,170 @@ class LinkedReleasePPGLM:
                 f"[{self.n_neurons}, {n_bins}], got {arr.shape}."
             )
         return arr[:, b]
+
+    # -----------------------------------------------------------------
+    # Release-site processing
+    # -----------------------------------------------------------------
+
+    def _process_release_site(
+        self,
+        *,
+        pre: str,
+        pre_idx: int,
+        site_idx: int,
+        site: ReleaseSite,
+        parent_spike_time_s: float,
+        current_bin: int,
+        p_eff: float,
+        stp_x: np.ndarray,
+        pending_input: np.ndarray,
+        release_records: List[Dict[str, Any]],
+    ) -> None:
+        n_partners = len(site.partners)
+        post_idx = self._cache_post_idx[site_idx]       # pre-computed
+        eff_weight = self._cache_eff_weight[site_idx]   # pre-computed
+        delay_bin = self._cache_delay_bin[site_idx]     # pre-computed
+
+        # Release success/failure — one draw if shared, one per partner otherwise.
+        if site.share_release_across_partners:
+            released = np.full(n_partners, self.rng.random() < p_eff)
+        else:
+            released = self.rng.random(n_partners) < p_eff
+
+        # Amplitude Q.
+        if site.q_mode == "fixed":
+            q = np.full(n_partners, site.q_mean)
+        elif site.share_amplitude_across_partners:
+            q = np.full(n_partners, self._draw_amplitude(site))
+        else:
+            q = np.array([self._draw_amplitude(site) for _ in range(n_partners)])
+        if site.conserve_amplitude_across_partners and n_partners > 0:
+            q = q / n_partners
+
+        # Latency jitter — vectorised draw.
+        if site.jitter_sd_s == 0.0:
+            jitter = np.zeros(n_partners)
+        elif site.share_jitter_across_partners:
+            jitter = np.full(n_partners, self.rng.normal(0.0, site.jitter_sd_s))
+        else:
+            jitter = self.rng.normal(0.0, site.jitter_sd_s, size=n_partners)
+
+        # STP depletion on any success.
+        if site.stp_enabled and released.any():
+            stp_x[site_idx] = max(
+                0.0, stp_x[site_idx] - site.stp_depletion_per_success
+            )
+
+        # Arrival bins (vectorised). parent_spike_time_s == current_bin * dt_s exactly.
+        jitter_bins = np.round(jitter / self.dt_s).astype(int)
+        arrival_bins = np.maximum(current_bin + delay_bin + jitter_bins, current_bin + 1)
+
+        # Amplitudes and pending_input update (vectorised, safe for repeated post_idx).
+        amplitudes = released.astype(float) * q * eff_weight
+        mask = released & (arrival_bins < pending_input.shape[1])
+        if mask.any():
+            np.add.at(pending_input, (post_idx[mask], arrival_bins[mask]), amplitudes[mask])
+
+        # Optional recording.
+        if self.record_failed_release_attempts or released.any():
+            for i in range(n_partners):
+                if released[i] or self.record_failed_release_attempts:
+                    release_records.append(
+                        {
+                            "parent_spike_time_s": parent_spike_time_s,
+                            "arrival_time_s": float(arrival_bins[i]) * self.dt_s,
+                            "pre": pre,
+                            "pre_idx": pre_idx,
+                            "synapse_id": site.synapse_id,
+                            "site_uid": site.uid,
+                            "post": site.partners[i],
+                            "post_idx": int(post_idx[i]),
+                            "released": bool(released[i]),
+                            "p_release_eff": p_eff,
+                            "q": float(q[i]),
+                            "weight": site.weight,
+                            "effective_weight": float(eff_weight[i]),
+                            "amplitude": float(amplitudes[i]),
+                            "delay_s": site.delay_s,
+                            "jitter_s": float(jitter[i]),
+                            "n_partners_at_site": n_partners,
+                            "stp_x_after": float(stp_x[site_idx]),
+                        }
+                    )
+
+    def _draw_release_probability(
+        self,
+        *,
+        pre: str,
+        pre_idx: int,
+        site: ReleaseSite,
+        stp_x_value: float,
+        spike_context: Dict[str, float],
+    ) -> float:
+        mode = site.p_mode or self.default_p_mode
+
+        if mode == "neuron_constant":
+            p = self._neuron_p_release[pre_idx]
+
+        elif mode == "site_constant":
+            p = self._neuron_p_release[pre_idx] if site.p_release is None else site.p_release
+
+        elif mode == "site_beta_static":
+            p = self._site_beta_static_p[site.uid]
+
+        elif mode == "neuron_beta_static":
+            p = self._neuron_beta_static_p[pre]
+
+        elif mode == "site_gamma_cox_per_spike":
+            npar = self.neuron_params[pre]
+            rho = self.rng.gamma(site.gamma_shape, site.gamma_scale)
+            p = 1.0 - np.exp(-rho * site.gamma_cox_scale)
+
+        elif mode == "neuron_gamma_cox_per_spike":
+            key = f"neuron_gamma_cox:{pre_idx}"
+            if key not in spike_context:
+                npar = self.neuron_params[pre]
+                rho = self.rng.gamma(npar.gamma_shape, npar.gamma_scale)
+                spike_context[key] = 1.0 - np.exp(-rho * npar.gamma_cox_scale)
+            p = spike_context[key]
+
+        else:
+            raise ValueError(f"Unknown p_mode: {mode!r}")
+
+        p = float(p)
+        if p < 0.0:
+            p = 0.0
+        elif p > 1.0:
+            p = 1.0
+
+        if site.stp_enabled:
+            p *= max(0.0, min(1.0, stp_x_value))
+
+        return p
+
+    def _draw_amplitude(self, site: ReleaseSite) -> float:
+        if site.q_mode == "fixed":
+            return float(site.q_mean)
+
+        if site.q_mode == "gamma":
+            shape = max(site.q_gamma_shape, 1e-12)
+            scale = site.q_mean / shape
+            return float(self.rng.gamma(shape, scale))
+
+        if site.q_mode == "lognormal":
+            sigma = site.q_lognormal_sigma
+            mu = np.log(max(site.q_mean, 1e-12)) - 0.5 * sigma**2
+            return float(self.rng.lognormal(mean=mu, sigma=sigma))
+
+        raise ValueError(f"Unknown q_mode: {site.q_mode!r}")
+
+    def _recover_stp(self, stp_x: np.ndarray) -> None:
+        for site_idx in self._stp_site_indices:
+            site = self.release_sites[site_idx]
+            tau = max(site.stp_tau_recovery_s, 1e-12)
+            recovery_fraction = 1.0 - np.exp(-self.dt_s / tau)
+            stp_x[site_idx] += (1.0 - stp_x[site_idx]) * recovery_fraction
+            stp_x[site_idx] = np.clip(stp_x[site_idx], 0.0, 1.0)
 
     def _make_forced_spike_matrix(
         self,
@@ -872,31 +920,64 @@ class LinkedReleasePPGLM:
 #%% creating fake networks 
 
 def load_connectome_from_csv(con_path: str, inhibitory_neurons_path: str, axo_axonic_path: str,
-                             postsyn_col: str = 'postsynaptic_to', presyn_col: str = 'presynaptic_to', 
-                             connector_col: str = 'connector_id'):
+                             postsyn_col: str = 'postsynaptic_id', presyn_col: str = 'presynaptic_id', 
+                             connector_col: str = 'connector_id',
+                             syn_weight: float = 8.0):
     con = pd.read_csv(con_path)
+    con = con.dropna(subset=[presyn_col]) # drop rows with missing presynaptic_id
     con[postsyn_col] = con[postsyn_col].apply(ast.literal_eval)
     con[presyn_col] = con[presyn_col].astype(int)
     con[connector_col] = con[connector_col].astype(str)
+    # drop rows with empty postsynaptic partners
+    con = con[con[postsyn_col].apply(lambda x: isinstance(x, list) and len(x) > 0)]
 
     # convert to connectivity dict format: {pre: {synapse_id: [postsynaptic partners]}}
-    connectivity: Dict[str, Dict[str, List[str]]] = {}
-    con.groupby(presyn_col).apply(lambda g: connectivity.setdefault(str(g.name), {}).update(
+    connectivity: Dict[int, Dict[str, List[int]]] = {}
+    con.groupby(presyn_col).apply(lambda g: connectivity.setdefault(int(g.name), {}).update(
         {connector_id: postsyn_list for connector_id, postsyn_list in zip(g[connector_col], g[postsyn_col])}
-    ))
+    ), include_groups=False)
 
-    # inhibitory neurons 
+    # inhibitory neurons
     inh = pd.read_csv(inhibitory_neurons_path)
     inhibitory_neurons = set(inh['skid'].tolist())
 
-    # get neurons for sim 
-    neurons = list(con[presyn_col].append(con[postsyn_col].explode()).unique())
+    # get neurons for sim
+    neurons = list(pd.concat([con[presyn_col], con[postsyn_col].explode()]).unique())
 
     inhibitory_neurons = set([n for n in inhibitory_neurons if n in neurons])
 
-    # synapse defaults aby pre 
-    raise NotImplementedError("synapse defaults by pre not implemented yet, need to load from csv if desired")
-    # kc aco axonic synapses with special synapse ones
+    # synapse defaults by pre - make inhibitory neurons have negative weights
+    synapse_defaults_by_pre = {
+        neuron: {"weight": -syn_weight if neuron in inhibitory_neurons else syn_weight}
+        for neuron in neurons
+    }
+
+    # kc aco axonic synapses with special synapses - should be inhibitory if axo-axonic KC to KC
+    axo_axonic = pd.read_csv(axo_axonic_path) # should have same column names as con_path
+    if presyn_col not in axo_axonic.columns:
+        axo_axonic.rename(columns={'presynaptic_to': presyn_col}, inplace=True)
+    if postsyn_col not in axo_axonic.columns:
+        axo_axonic.rename(columns={'postsynaptic_to': postsyn_col}, inplace=True)
+    axo_axonic[presyn_col] = axo_axonic[presyn_col].astype(int)
+    axo_axonic[connector_col] = axo_axonic[connector_col].astype(str)
+    axo_axonic[postsyn_col] = axo_axonic[postsyn_col].apply(ast.literal_eval)
+
+    # use synapse_params with partner_weight_multipliers to invert effect
+    synapse_params: Dict[int, Dict[str, Dict[int, Any]]] = {}
+    for _, row in axo_axonic.iterrows():
+        pre = int(row[presyn_col])
+        synapse_id = row[connector_col]
+        partners = row[postsyn_col]
+
+        if pre not in synapse_params:
+            synapse_params[pre] = {}
+
+        synapse_params[pre][synapse_id] = {
+            "partner_weight_multipliers": {int(partner): -1.0 for partner in partners}
+        }
+    
+    return neurons, connectivity, synapse_defaults_by_pre, inhibitory_neurons, synapse_params
+
 
 
 
@@ -959,25 +1040,54 @@ def create_connectome(n_neurons: int = 10, n_inhibitory: int = 2, \
 
 def flatten_connectome(
     connectivity: Mapping[str, Mapping[str, Sequence[str]]],
-) -> Dict[str, Dict[str, List[str]]]:
+    synapse_params: Optional[Mapping[str, Mapping[str, Mapping[str, Any]]]] = None,
+) -> Tuple[Dict[str, Dict[str, List[str]]], Dict[str, Dict[str, Dict[str, Any]]]]:
     """
     Expand polyadic synapses into monadic ones, keeping the same
     nested-dict format as `connectivity`.
 
     Each (pre, synapse_id) with N>1 partners becomes N synapses
-    (synapse_id__0, synapse_id__1, ...), each with a single partner.
+    (synapse_id_0, synapse_id_1, ...), each with a single partner.
+
+    synapse_params entries for split synapses are propagated to each
+    sub-synapse. `partner_weight_multipliers` is filtered to only the
+    single partner that sub-synapse targets.
+
+    Returns (flat_connectivity, flat_synapse_params).
     """
     flat: Dict[str, Dict[str, List[str]]] = {}
+    flat_synapse_params: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
     for pre, synapse_dict in connectivity.items():
         flat[pre] = {}
+        pre_params = (synapse_params or {}).get(pre, {})
+
         for synapse_id, partners in synapse_dict.items():
             partners = list(partners)
+            original_params = pre_params.get(synapse_id, {})
+
             if len(partners) <= 1:
                 flat[pre][synapse_id] = list(partners)
+                if original_params:
+                    flat_synapse_params.setdefault(pre, {})[synapse_id] = dict(original_params)
             else:
                 for i, post in enumerate(partners):
-                    flat[pre][f"{synapse_id}_{i}"] = [post]
-    return flat
+                    new_id = f"{synapse_id}_{i}"
+                    flat[pre][new_id] = [post]
+
+                    if original_params:
+                        new_params = dict(original_params)
+                        pwm = new_params.get("partner_weight_multipliers")
+                        if pwm is not None:
+                            filtered = {post: pwm[post]} if post in pwm else {}
+                            if filtered:
+                                new_params["partner_weight_multipliers"] = filtered
+                            else:
+                                del new_params["partner_weight_multipliers"]
+                        if new_params:
+                            flat_synapse_params.setdefault(pre, {})[new_id] = new_params
+
+    return flat, flat_synapse_params
 
 
 def create_spikes(start: float, end: float, Hz: float) -> List[float]:
@@ -1012,7 +1122,7 @@ Note: to simulate, have 3 options currently:
 3. provide external drive to A via external_log_drive argument, e.g. external_log_drive=lambda t, names: np.array([2.0 if name == "A" and 0.2 <= t <= 0.6 else 0.0 for name in names])  
 '''
 
-global_syn_weight = 8.0
+global_syn_weight = 1.0
 global_synapse_defaults = {
     "weight": global_syn_weight,
     "delay_s": 0.0018, # 1.8ms from shiu et al 2025
@@ -1027,37 +1137,67 @@ global_synapse_defaults = {
     "stp_enabled": False,
 }
 
-synapse_defaults_by_pre = None
-synapse_params = None # could be used for exact synapse-by-synapse params 
+# neuron params 
 global_base_rate_hz = 0.0
 global_p_release = 0.5
 self_history_weight = -3.0 # negative values create refractoriness, positive values create self-excitation
 self_history_tau_s = 0.020 # decay time constant of the self-history effect
-mean_polyadic_fraction = 0.4
-mean_polyadic_size = 4.0
-mean_outgoing = 20
-sd_outgoing = 5
 
 # input params 
 input_frequency_hz = 80.0
 input_start = 0.0
 input_end = 5.0
 jitter_input = 0.002 # add some jitter to input spike times to avoid perfect synchrony across partners
-n_input_neurons = 2
 
-# get network 
-neurons, connectivity, synapse_defaults_by_pre, inhibitory_neurons = create_connectome(n_neurons = 10, n_inhibitory= 2, \
-                        mean_outgoing = mean_outgoing, sd_outgoing = sd_outgoing, \
-                        mean_polyadic_fraction = mean_polyadic_fraction, sd_polyadic_fraction = 0.3,
-                        mean_polyadic_size = mean_polyadic_size,   # mean # partners when site is polyadic
-                        sd_polyadic_size = 1.0, syn_weight = global_syn_weight)
-flat_connectivity = flatten_connectome(connectivity)
+# input params 
+n_input_neurons = 5
+input_seed = 510
 
+# restrict to just kcs for instance 
+neuron_details = pd.read_csv("data/neuron_details.csv")
+potential_inputs = neuron_details[neuron_details["celltype"] == "KCs"]["skeleton_id"].tolist() # None is an option for random connectome
+
+### REAL NETWORK 
+neurons, connectivity, synapse_defaults_by_pre, inhibitory_neurons, synapse_params = load_connectome_from_csv(
+    con_path="data/polyadic_connectors.csv",
+    inhibitory_neurons_path="data/2026_02_inhibitory_neurons.csv",
+    axo_axonic_path="data/kc_axo_axonic.csv",
+    syn_weight=global_syn_weight,
+)
+
+### RANDOM NETWORK 
+# connectome creation parameters 
+# mean_polyadic_fraction = 0.4
+# mean_polyadic_size = 4.0
+# mean_outgoing = 20
+# sd_outgoing = 5
+
+# neurons, connectivity, synapse_defaults_by_pre, inhibitory_neurons = create_connectome(n_neurons = 10, n_inhibitory= 2, \
+#                         mean_outgoing = mean_outgoing, sd_outgoing = sd_outgoing, \
+#                         smean_polyadic_fraction = mean_polyadic_fraction, sd_polyadic_fraction = 0.3,
+#                         mean_polyadic_size = mean_polyadic_size,   # mean # partners when site is polyadic
+#                         sd_polyadic_size = 1.0, syn_weight = global_syn_weight)
+# synapse_params = None 
+
+
+### FLATTEN NETWORK
+flat_connectivity, flat_synapse_params = flatten_connectome(connectivity, synapse_params=synapse_params)
+
+
+### Create neuron params 
 neuron_params = { neu: {"base_rate_hz": global_base_rate_hz, "p_release": global_p_release, 
           "self_history_weight": self_history_weight, "self_history_tau_s": self_history_tau_s} for neu in neurons}
 
+### Get inputs 
+excitatory_neurons = [n for n in neurons if n not in inhibitory_neurons]
+if potential_inputs is None:
+    potential_inputs = excitatory_neurons
 
-n_sims = 10
+# choose a random set of those 
+rng_input = np.random.default_rng(input_seed)
+input_neuron = rng_input.choice(potential_inputs, size=min(n_input_neurons, len(potential_inputs)), replace=False).tolist()
+
+n_sims = 1
 spikes = []
 flat_spikes = []
 for sim_id in range(n_sims):
@@ -1081,14 +1221,11 @@ for sim_id in range(n_sims):
         neuron_params=neuron_params,
         global_synapse_defaults=global_synapse_defaults,
         synapse_defaults_by_pre=synapse_defaults_by_pre,
-        synapse_params=synapse_params,
+        synapse_params=flat_synapse_params,
         dt_s=0.001,
         t_stop_s=5.0,
         seed=1,
     )
-
-    excitatory_neurons = [n for n in neurons if n not in inhibitory_neurons]
-    input_neuron = excitatory_neurons[:n_input_neurons]
 
     clamped_spikes = {inp: create_spikes_with_endpoint_jitter(input_start, input_end, input_frequency_hz, jitter_input) for inp in input_neuron}
 
@@ -1096,10 +1233,13 @@ for sim_id in range(n_sims):
     result = model.simulate(
         clamped_spikes=clamped_spikes
     )
-    print(f"Simulation {sim_id+1} took {time.time() - stime:.4f} seconds")
+    
+    print(f"Polyadic simulation {sim_id+1} took {time.time() - stime:.4f} seconds")
+    stime = time.time()
     flat_result = flat_model.simulate(
         clamped_spikes=clamped_spikes
     )
+    print(f"Flat simulation {sim_id+1} took {time.time() - stime:.4f} seconds")
 
     spikes.append(result.spikes.assign(sim_id=sim_id))
     flat_spikes.append(flat_result.spikes.assign(sim_id=sim_id))
@@ -1136,6 +1276,8 @@ sns.stripplot(data=combined_spikes.groupby(['neuron', 'arch', 'sim_id']).size().
 sns.stripplot(data=combined_spikes.groupby(['arch', 'sim_id']).size().reset_index(name='count'), x='arch', y='count', palette="muted", s=s,ax=ax[1])
 ax[0].set_ylabel("Spike count")
 ax[1].set_ylabel("Total spike count")
+ax[0].set_xticklabels(ax[0].get_xticklabels(), rotation=90)
+ax[0].legend(bbox_to_anchor=(1, 1), loc='upper left')
 fig.tight_layout()
 
 
